@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import copy
+import re
 from typing import TypedDict, Annotated, Any
 from collections import defaultdict
 
@@ -58,6 +59,30 @@ def parse_model_json(content: str) -> Any:
     content = content.strip()
     
     return json.loads(content)
+
+
+def parse_summary_highlights_response(content: str) -> dict:
+    """
+    Some upstream instructions ask for XML-style tags like
+    <UserStories> ... </UserStories>. This helper extracts those sections
+    and parses the enclosed JSON. If no such tags exist, returns {}.
+    """
+    cleaned = content.replace("TERMINATE", "").strip()
+    sections: dict[str, Any] = {}
+    
+    for key in ("UserStories", "RFDList", "Summary_highlights"):
+        pattern = rf"<{key}>(.*?)</{key}>"
+        match = re.search(pattern, cleaned, flags=re.DOTALL | re.IGNORECASE)
+        if match:
+            section_text = match.group(1).strip()
+            if section_text:
+                try:
+                    sections[key] = json.loads(section_text)
+                except json.JSONDecodeError:
+                    # try to fix common stray commas or quotes by best-effort
+                    pass
+    
+    return sections
 
 
 # ============================================================================
@@ -468,10 +493,16 @@ Output ONLY the JSON object with UserStories, RFDList, Summary_highlights"""
     model = init_chat_model(model="gpt-4.1")
     response = model.invoke(messages)
     
+    content = response.content if isinstance(response.content, str) else str(response.content)
+    
     try:
-        output = parse_model_json(response.content)
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
-        raise ValueError("summary_highlights_agent returned unparsable content") from exc
+        output = parse_model_json(content)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        fallback_output = parse_summary_highlights_response(content)
+        if fallback_output:
+            output = fallback_output
+        else:
+            raise ValueError("summary_highlights_agent returned unparsable content") from None
     
     if not isinstance(output, dict):
         output = {}
